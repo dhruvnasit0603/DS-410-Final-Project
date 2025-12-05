@@ -1,241 +1,271 @@
-# ==================================================
-# Example Test Runs with Extreme Cases
-# ==================================================
+import os
+import json
+import time
+from pathlib import Path
 
-from pyspark.sql import SparkSession
-from pyspark.ml.pipeline import PipelineModel
-import pyspark.sql.functions as F
-import pyspark.sql.types as T
+import pandas as pd
+from openai import OpenAI
 
-from pyspark.sql.types import DoubleType
-from pyspark.sql.functions import udf
-from pyspark.ml.linalg import Vector
+INPUT_CSV = Path("tweets_cleaned.csv")
+OUTPUT_CSV = Path("tweets_with_topics_v1.csv")
 
-# ------------------------------------------
-# Start Spark Session
-# ------------------------------------------
-spark = (
-    SparkSession.builder
-    .appName("GBTPredictionTest_ExtremeCases")
-    .getOrCreate()
-)
+# GPT model name
+GPT_MODEL = "gpt-4.1-mini"
 
-print("Spark session started!")
 
-# ==================================================
-# Example Test Runs with Extreme Cases (String flags)
-# ==================================================
+# Batch size: number of tweets per API call
+BATCH_SIZE = 25
 
-from pyspark.sql import SparkSession
-from pyspark.ml.pipeline import PipelineModel
-import pyspark.sql.functions as F
-import pyspark.sql.types as T
 
-# ------------------------------------------
-# Start Spark Session
-# ------------------------------------------
-spark = (
-    SparkSession.builder
-    .appName("GBTPredictionTest_ExtremeCases")
-    .getOrCreate()
-)
+# OpenAI API key
+client = OpenAI(api_key="")
 
-print("Spark session started!")
+# CATEGORY DEFINITIONS
 
-# ------------------------------------------
-# Load trained GBT PipelineModel
-# ------------------------------------------
-model_path = "/storage/work/yfl5682/Project/models/gbt_model"
-gbt_loaded = PipelineModel.load(model_path)
 
-print("Model loaded!")
-
-# ------------------------------------------
-# Example Test Data (all string flags)
-# ------------------------------------------
-data = [
-    # Case 1: Baseline (your original)
-    (
-        "case_01_baseline",                       # id
-        "China Trade Deal is going very well!",   # text
-        "Trade Policy & Industrial / Manufacturing",  # category
-        "Market / Economy / Jobs",                # blue_category
-        "Positive",                               # sentiment
-        "Medium",                                 # intensity
-        "True",                                   # during_trading_hours
-        "True",                                   # has_market_action_keywords
-        "False",                                  # towards_ceo_or_company
-        12000,                                    # favorites
-        2300,                                     # retweets
-        10,                                       # tweet_hour
-        3,                                        # doy
-        35,                                       # text_len
-        0,                                        # num_exclam
-        0.00042,                                  # rv_pre_30m
-        3280.55                                   # Close
-    ),
-
-    # Case 2: Macro crash warning – viral, very negative, high RV
-    (
-        "case_02_macro_crash_warning",
-        "Markets are CRASHING!!! Emergency rate cut coming, this is going to be ugly!!!",
-        "Macroeconomics & Monetary Policies",
-        "Market / Economy / Jobs",
-        "Negative",
-        "High",
-        "True",          # during_trading_hours
-        "True",          # has_market_action_keywords
-        "False",
-        350000,          # favorites
-        90000,           # retweets
-        9,               # tweet_hour
-        1,               # doy
-        110,             # text_len
-        6,               # num_exclam
-        0.02,            # rv_pre_30m (very high)
-        2700.00
-    ),
-
-    # Case 3: Trade war escalation at night – high RV, big engagement
-    (
-        "case_03_trade_war_midnight",
-        "Starting TOMORROW, massive NEW TARIFFS on China. Companies have been warned!",
-        "Trade Policy & Industrial / Manufacturing",
-        "Market / Economy / Jobs",
-        "Negative",
-        "High",
-        "False",         # during_trading_hours (night)
-        "True",
-        "False",
-        200000,
-        80000,
-        23,              # tweet_hour
-        5,               # doy
-        95,
-        3,
-        0.015,           # rv_pre_30m
-        2900.00
-    ),
-
-    # Case 4: Energy shock – OPEC+ production cuts
-    (
-        "case_04_energy_shock",
-        "Historic deal! OPEC+ just agreed to MASSIVE production cuts. Oil prices will skyrocket!",
-        "Energy, Oil & Gas, Renewables",
-        "Market / Economy / Jobs",
-        "Positive",
-        "High",
-        "True",
-        "True",
-        "False",
-        180000,
-        60000,
-        14,              # tweet_hour
-        4,               # doy
-        100,
-        2,
-        0.018,
-        3200.00
-    ),
-
-    # Case 5: Super boring, low engagement, tiny RV
-    (
-        "case_05_boring_low_engagement",
-        "Had a nice meeting today. Beautiful day in Washington.",
-        "Macroeconomics & Monetary Policies",
-        "Market / Economy / Jobs",
-        "Neutral",
-        "Low",
-        "True",
-        "False",
-        "False",
-        0,
-        0,
-        11,
-        2,
-        60,
-        0,
-        0.00005,
-        3100.00
-    ),
-
-    # Case 6: Company-specific attack, high engagement, medium RV
-    (
-        "case_06_company_specific_attack",
-        "This CEO has FAILED. New regulations & investigations coming VERY SOON!",
-        "Regulation & Legal / Antitrust / Policy",
-        "Company / Earnings / Guidance",
-        "Negative",
-        "High",
-        "True",
-        "True",
-        "True",          # towards_ceo_or_company
-        90000,
-        30000,
-        15,
-        3,
-        85,
-        3,
-        0.008,
-        3300.00
-    ),
+TOPIC_CATEGORIES = [
+    {
+        "id": "macro",
+        "name": "Macroeconomics & Monetary Policies",
+        "description": (
+            "Tweets referring to broad economic conditions, growth, "
+            "unemployment, inflation, GDP, or the Federal Reserve."
+        ),
+    },
+    {
+        "id": "trade",
+        "name": "Trade Policy & Industrial / Manufacturing",
+        "description": (
+            "Trade disputes, tariffs, manufacturing policies, "
+            "import/export, China trade, supply chains."
+        ),
+    },
+    {
+        "id": "energy",
+        "name": "Energy, Oil & Gas, Renewables",
+        "description": (
+            "Energy independence, oil prices, fracking, pipelines, "
+            "OPEC references, renewable energy comments."
+        ),
+    },
+    {
+        "id": "defense",
+        "name": "Defense, Military, Sanctions, Geopolitics",
+        "description": (
+            "Foreign policy, military deployments, NATO, sanctions, "
+            "conflicts, national security."
+        ),
+    },
+    {
+        "id": "regulation",
+        "name": "Regulation, Antitrust, Legal Actions",
+        "description": (
+            "Regulatory actions, investigations, bans, tax policy, "
+            "antitrust issues, legal threats."
+        ),
+    },
+    {
+        "id": "campaign",
+        "name": "Campaign / Rally / Election Politics",
+        "description": (
+            "Campaign events, rallies, slogans, partisan attacks, "
+            "polling, endorsements."
+        ),
+    },
+    {
+        "id": "social",
+        "name": "Personal, Social, or Non-Policy Content",
+        "description": (
+            "Personal remarks, greetings, daily life, sports, "
+            "non-economic commentary."
+        ),
+    },
+    {
+        "id": "uncategorized",
+        "name": "Uncategorized",
+        "description": "Anything that does not clearly fit the above categories.",
+    },
 ]
 
-# ------------------------------------------
-# Schema (string for sentiment/intensity/flags)
-# ------------------------------------------
-schema = T.StructType([
-    T.StructField("id", T.StringType()),
-    T.StructField("text", T.StringType()),
-    T.StructField("category", T.StringType()),
-    T.StructField("blue_category", T.StringType()),
-    T.StructField("sentiment", T.StringType()),
-    T.StructField("intensity", T.StringType()),
-    T.StructField("during_trading_hours", T.StringType()),
-    T.StructField("has_market_action_keywords", T.StringType()),
-    T.StructField("towards_ceo_or_company", T.StringType()),
-    T.StructField("favorites", T.IntegerType()),
-    T.StructField("retweets", T.IntegerType()),
-    T.StructField("tweet_hour", T.IntegerType()),
-    T.StructField("doy", T.IntegerType()),
-    T.StructField("text_len", T.IntegerType()),
-    T.StructField("num_exclam", T.IntegerType()),
-    T.StructField("rv_pre_30m", T.DoubleType()),
-    T.StructField("Close", T.DoubleType()),
-])
+PROMPT_VERSION = "v1_topic8"  # just for reference 
 
-test_df = spark.createDataFrame(data, schema)
 
-print("Test DataFrame created!")
-test_df.select(
-    "id", "sentiment", "intensity",
-    "during_trading_hours", "has_market_action_keywords",
-    "towards_ceo_or_company", "favorites", "retweets",
-    "rv_pre_30m", "tweet_hour", "doy"
-).show(truncate=False)
+def _build_category_text() -> str:
+    """
+    Build a human-readable description of all categories for the prompt.
+    """
+    lines: list[str] = []
+    for cat in TOPIC_CATEGORIES:
+        line = f"- ({cat['id']}) {cat['name']}: {cat['description']}"
+        lines.append(line)
+    return "\n".join(lines)
 
-# ==========================================
-# Run Prediction
-# ==========================================
-# UDF to extract P(label=1) from probability vector
-def get_prob_event(v: Vector):
-    if v is None:
-        return None
-    # index 1 = probability for class 1 (event)
-    return float(v[1])
 
-get_prob_event_udf = udf(get_prob_event, DoubleType())
+CATEGORY_TEXT = _build_category_text()
 
-pred = gbt_loaded.transform(test_df)
 
-# Add prob_event column
-pred = pred.withColumn("prob_event", get_prob_event_udf("probability"))
+# ============================
+# PROMPT BUILDING 
+# ============================
 
-print("\n=== Prediction Results (sorted by prob_event DESC) ===")
-pred.select(
-    "id",
-    "prediction",
-    "prob_event",
-    "probability"
-).orderBy(F.col("prob_event").desc()) \
- .show(truncate=False)
+def build_system_message() -> str:
+    """
+    System message: explains the task and required JSON output format.
+    """
+    return f"""
+You are a classification engine. Your job is to assign EXACTLY ONE topic category
+to each tweet based on its text.
+
+Use the following categories:
+
+{CATEGORY_TEXT}
+
+For each tweet, you MUST choose exactly one of the category NAMES above.
+Do NOT invent new categories.
+
+Output STRICTLY in JSON list format, one object per tweet, like:
+
+[
+  {{ "id": "123", "category": "Macroeconomics & Monetary Policies" }},
+  {{ "id": "456", "category": "Personal, Social, or Non-Policy Content" }}
+]
+
+Rules:
+- Use the category NAME exactly as written above (case-sensitive).
+- Ensure the JSON is valid.
+- The order of objects in the list must match the order of tweets given.
+
+---
+System version: {PROMPT_VERSION}
+"""
+
+
+def build_user_message(tweets_batch: list[dict]) -> str:
+    """
+    User message: contains the actual tweets to classify.
+    """
+    lines: list[str] = ["Here are the tweets to classify:"]
+
+    for i, tw in enumerate(tweets_batch, start=1):
+        tweet_text = (tw.get("text") or "").replace("\n", " ")
+        lines.append(f"\nTweet {i}:")
+        lines.append(f"ID: {tw['id']}")
+        lines.append(f"Text: {tweet_text}")
+
+    return "\n".join(lines)
+
+
+# ============================
+# GPT CALL 
+# ============================
+
+def classify_batch_with_gpt(tweets_batch: list[dict]) -> dict:
+    """
+    Call GPT to classify a batch of tweets.
+
+    Returns:
+        A dict mapping tweet_id -> category_name.
+    """
+    system_message = build_system_message()
+    user_message = build_user_message(tweets_batch)
+
+    # Prepare messages for Chat Completions API
+    messages = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": user_message},
+    ]
+
+    # Simple retry loop in case of transient errors 
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=GPT_MODEL,
+                messages=messages,
+                temperature=0.0,
+            )
+            content = response.choices[0].message.content
+
+            # Parse JSON output 
+            data = json.loads(content)
+
+            # Expecting a list of objects: [{"id": "...", "category": "..."}, ...]
+            id_to_category = {}
+            for item in data:
+                tid = str(item["id"])
+                cat_name = str(item["category"])
+                id_to_category[tid] = cat_name
+
+            return id_to_category
+
+        except Exception as e:
+            print(f"[WARN] GPT call failed (attempt {attempt+1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2)  # brief backoff 
+
+    # Should not reach here normally 
+    return {}
+
+
+# ============================
+# MAIN SCRIPT 
+# ============================
+
+def main():
+    # 1) Load dataset 
+    print(f"Loading tweets from: {INPUT_CSV}")
+    df = pd.read_csv(INPUT_CSV)
+
+    # Ensure 'id' and 'text' exist 
+    required_cols = ["id", "text"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+
+    # Convert id to string to avoid issues / 
+    df["id"] = df["id"].astype(str)
+
+    # 2) Initialize category column 
+    if "category" not in df.columns:
+        df["category"] = None  # fill later 
+
+    # 3) Build list of all tweet dictionaries 
+    tweets = [
+        {"id": row["id"], "text": row["text"]}
+        for _, row in df.iterrows()
+    ]
+
+    total = len(tweets)
+    print(f"Total tweets to classify: {total}")
+
+    # 4) Process in batches 
+    for start in range(0, total, BATCH_SIZE):
+        end = min(start + BATCH_SIZE, total)
+        batch = tweets[start:end]
+
+        print(f"Classifying batch {start}–{end-1} (size={len(batch)})...")
+
+        # Call GPT for this batch 
+        id_to_category = classify_batch_with_gpt(batch)
+
+        # 5) Write results back into DataFrame 
+        for tw in batch:
+            tid = str(tw["id"])
+            if tid in id_to_category:
+                df.loc[df["id"] == tid, "category"] = id_to_category[tid]
+
+        # Optional: save intermediate result every few batches
+        if (start // BATCH_SIZE) % 20 == 0:  # every 20 batches
+            tmp_path = OUTPUT_CSV.with_suffix(".tmp.csv")
+            print(f"Saving intermediate result to {tmp_path} ...")
+            df.to_csv(tmp_path, index=False)
+
+    # 6) Save final CSV / 保存最终 CSV
+    print(f"Saving final labeled tweets to: {OUTPUT_CSV}")
+    df.to_csv(OUTPUT_CSV, index=False)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
